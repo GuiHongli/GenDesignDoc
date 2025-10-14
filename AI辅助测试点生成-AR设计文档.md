@@ -24,7 +24,173 @@
 
 ## 2 功能实现分析
 
-### 2.1 功能点清单
+### 2.1 总体架构设计
+
+#### 2.1.1 系统架构图
+
+```plantuml
+@startuml
+!define RECTANGLE class
+
+package "前端层" {
+    [浏览器] as Browser
+    [Vue 3应用] as VueApp
+    [Pinia Store] as Store
+    [Axios HTTP客户端] as Axios
+    [WebSocket客户端] as WSClient
+}
+
+package "后端层" {
+    [Nginx负载均衡] as Nginx
+    [Spring Boot应用1] as App1
+    [Spring Boot应用2] as App2
+    [Controller层] as Controller
+    [Service层] as Service
+    [MyBatis DAO层] as DAO
+}
+
+package "数据层" {
+    database "MySQL主库" as DBMaster
+    database "MySQL从库" as DBSlave
+}
+
+package "外部服务层" {
+    [AI模型服务] as AIService
+    [作业系统API] as WorkAPI
+    [运营平台API] as OpsAPI
+}
+
+Browser --> VueApp
+VueApp --> Store
+VueApp --> Axios
+VueApp --> WSClient
+
+Axios --> Nginx : REST API
+WSClient --> Nginx : WebSocket
+
+Nginx --> App1
+Nginx --> App2
+
+App1 --> Controller
+App2 --> Controller
+Controller --> Service
+Service --> DAO
+
+DAO --> DBMaster : 写操作
+DAO --> DBSlave : 读操作
+
+DBMaster --> DBSlave : 主从同步
+
+Service --> AIService : HTTP调用
+Service --> WorkAPI : HTTP调用
+Service --> OpsAPI : HTTP调用
+
+@enduml
+```
+
+#### 2.1.2 前后端交互流程
+
+**整体数据流**：
+```plantuml
+@startuml
+actor 用户
+participant "Vue前端" as Frontend
+participant "Nginx" as LB
+participant "Spring Boot后端" as Backend
+database "MySQL" as DB
+participant "AI模型" as AI
+
+用户 -> Frontend: 1. 打开附屏界面
+Frontend -> LB: 2. HTTP GET /api/v1/init
+LB -> Backend: 3. 路由请求
+Backend -> DB: 4. 查询需求和Workflow
+DB --> Backend: 5. 返回数据
+Backend --> Frontend: 6. 返回初始化数据
+
+用户 -> Frontend: 7. 选择需求和Workflow
+Frontend -> LB: 8. HTTP POST /api/v1/workflow/execute
+LB -> Backend: 9. 执行Workflow
+Backend -> DB: 10. 获取配置
+Backend --> Frontend: 11. 返回Prompt模板
+
+用户 -> Frontend: 12. 确认生成
+Frontend -> LB: 13. WebSocket连接请求
+LB -> Backend: 14. 建立WebSocket连接
+Backend -> AI: 15. HTTP POST 调用AI模型
+activate AI
+
+loop 流式返回
+    AI --> Backend: 16. 返回数据块
+    Backend --> Frontend: 17. WebSocket推送
+    Frontend -> Frontend: 18. 实时渲染
+end
+
+AI --> Backend: 19. 生成完成
+deactivate AI
+
+Backend -> DB: 20. 保存测试点
+Backend --> Frontend: 21. 推送完成消息
+
+用户 -> Frontend: 22. 选择并接收测试点
+Frontend -> LB: 23. HTTP POST /api/v1/testpoints/accept
+LB -> Backend: 24. 保存接收状态
+Backend -> DB: 25. 更新状态
+Backend --> Frontend: 26. 返回成功
+
+用户 -> Frontend: 27. 确认回填
+Frontend -> LB: 28. HTTP POST /api/v1/testpoints/backfill
+LB -> Backend: 29. 回填操作
+Backend -> DB: 30. 记录回填日志
+Backend -> WorkAPI: 31. 调用作业系统API
+Backend -> OpsAPI: 32. 上报运营平台
+Backend --> Frontend: 33. 返回回填结果
+
+@enduml
+```
+
+#### 2.1.3 技术栈对比
+
+| 层次 | 前端技术栈 | 后端技术栈 |
+|-----|----------|----------|
+| 开发语言 | TypeScript | Java 8 |
+| 框架 | Vue 3 | Spring Boot 2.7.x |
+| 状态管理 | Pinia | - |
+| HTTP通信 | Axios | RestTemplate / OkHttp |
+| WebSocket | 原生WebSocket API | Spring WebSocket |
+| 数据持久化 | LocalStorage / SessionStorage | MyBatis + MySQL |
+| 构建工具 | Vite | Maven |
+| 代码规范 | ESLint + Prettier | Checkstyle |
+| 单元测试 | Vitest + Vue Test Utils | JUnit + Mockito |
+
+#### 2.1.4 接口设计规范
+
+**RESTful API规范**：
+- 使用标准HTTP方法：GET（查询）、POST（创建）、PUT（更新）、DELETE（删除）
+- URL路径使用名词复数形式：`/api/v1/requirements`、`/api/v1/workflows`
+- 使用HTTP状态码：200（成功）、400（请求错误）、401（未授权）、500（服务器错误）
+- 请求和响应统一使用JSON格式
+- 统一响应结构：
+```typescript
+interface ApiResponse<T> {
+    code: number;        // 业务状态码
+    message: string;     // 提示信息
+    data: T;            // 业务数据
+    timestamp: number;   // 时间戳
+    traceId: string;    // 追踪ID
+}
+```
+
+**WebSocket消息规范**：
+```typescript
+interface WebSocketMessage {
+    type: 'chunk' | 'complete' | 'error';  // 消息类型
+    sessionId: string;                      // 会话ID
+    data: any;                              // 消息数据
+    timestamp: number;                      // 时间戳
+}
+```
+
+### 2.2 功能点清单
 
 | 功能点ID | 功能点名称 | 优先级 | 说明 |
 |---------|----------|-------|------|
@@ -39,9 +205,9 @@
 | F009 | 重新生成机制 | P1 | 支持补充信息后重新生成测试点 |
 | F010 | 数据回填与上报 | P0 | 将测试点回填至作业系统并上报运营平台 |
 
-### 2.2 功能点1：附屏界面框架
+### 2.3 功能点1：附屏界面框架
 
-#### 详细描述
+#### 2.3.1 前端设计
 
 **功能说明**：
 参照TestMate交互方式，实现附屏界面框架，作为AI辅助测试点生成的主界面容器。
@@ -99,13 +265,180 @@ end note
 @enduml
 ```
 
-**技术实现**：
-- 前端框架：使用Vue 3 + TypeScript
+**前端技术栈**：
+- 前端框架：Vue 3 + TypeScript
 - UI组件库：Element Plus
 - 状态管理：Pinia
-- 通信方式：WebSocket（流式数据）+ RESTful API
+- HTTP客户端：Axios
+- WebSocket客户端：原生WebSocket API + 重连机制
+- 构建工具：Vite
+- 代码规范：ESLint + Prettier
 
-**接口定义**：
+**前端组件结构**：
+```plantuml
+@startuml
+package "页面层" {
+    [AISidePanelPage] as Page
+}
+
+package "容器组件" {
+    [RequirementSection] as Req
+    [WorkflowSection] as Workflow
+    [ParameterSection] as Param
+    [GenerationSection] as Gen
+    [ResultSection] as Result
+}
+
+package "基础组件" {
+    [RequirementList] as ReqList
+    [WorkflowSelector] as WfSelector
+    [ParameterViewer] as ParamView
+    [StreamingDisplay] as Stream
+    [TestPointCard] as Card
+    [ActionButtons] as Buttons
+}
+
+package "Store状态管理" {
+    [useSidePanelStore] as Store
+}
+
+Page --> Req
+Page --> Workflow
+Page --> Param
+Page --> Gen
+Page --> Result
+
+Req --> ReqList
+Workflow --> WfSelector
+Param --> ParamView
+Gen --> Store
+Result --> Stream
+Result --> Card
+Result --> Buttons
+
+@enduml
+```
+
+**前端状态管理**：
+```typescript
+// Pinia Store定义
+interface SidePanelState {
+    // 基础信息
+    panelId: string;
+    tsId: string;
+    userId: string;
+    
+    // 需求相关
+    requirements: Requirement[];
+    selectedRequirement: Requirement | null;
+    
+    // Workflow相关
+    workflows: WorkflowInfo[];
+    selectedWorkflow: WorkflowInfo | null;
+    workflowResult: WorkflowResult | null;
+    
+    // 生成相关
+    generationStatus: 'idle' | 'generating' | 'completed' | 'error';
+    testPoints: TestPoint[];
+    selectedTestPointIds: Set<string>;
+    
+    // WebSocket连接
+    wsConnected: boolean;
+    wsError: string | null;
+}
+```
+
+**前端路由配置**：
+```typescript
+// 路由定义
+const routes = [
+    {
+        path: '/tse/ai-testpoint-generation',
+        name: 'AITestPointGeneration',
+        component: () => import('@/views/AISidePanelPage.vue'),
+        meta: {
+            title: 'AI辅助测试点生成',
+            requiresAuth: true
+        }
+    }
+];
+```
+
+#### 2.3.2 后端设计
+
+**后端技术栈**：
+- 开发语言：Java 8
+- 框架：Spring Boot 2.7.x
+- Web框架：Spring MVC + Spring WebSocket
+- ORM框架：MyBatis 3.5.x
+- 数据库：MySQL 5.7+
+- 连接池：HikariCP
+- HTTP客户端：OkHttp / RestTemplate
+- JSON处理：Jackson
+
+**后端服务架构**：
+```plantuml
+@startuml
+package "Controller层" {
+    [SidePanelController] as Controller
+    [WebSocketHandler] as WSHandler
+}
+
+package "Service层" {
+    [SidePanelService] as Service
+    [RequirementService] as ReqService
+    [WorkflowService] as WfService
+    [TestPointService] as TPService
+}
+
+package "Domain层" {
+    [RequirementDomain] as ReqDomain
+    [WorkflowDomain] as WfDomain
+    [TestPointDomain] as TPDomain
+}
+
+package "DAO层" {
+    [RequirementMapper] as ReqMapper
+    [WorkflowMapper] as WfMapper
+    [TestPointMapper] as TPMapper
+}
+
+package "基础设施层" {
+    [MySQL Database] as DB
+}
+
+package "外部服务" {
+    [AI Model Service] as AI
+    [Work System API] as WorkSys
+    [Ops Platform API] as Ops
+}
+
+Controller --> Service
+WSHandler --> Service
+Service --> ReqService
+Service --> WfService
+Service --> TPService
+
+ReqService --> ReqDomain
+WfService --> WfDomain
+TPService --> TPDomain
+
+ReqDomain --> ReqMapper
+WfDomain --> WfMapper
+TPDomain --> TPMapper
+
+ReqMapper --> DB
+WfMapper --> DB
+TPMapper --> DB
+
+Service --> AI
+Service --> WorkSys
+Service --> Ops
+
+@enduml
+```
+
+**后端接口定义**：
 ```typescript
 // 附屏初始化接口
 interface SidePanelInitRequest {
@@ -121,14 +454,196 @@ interface SidePanelInitResponse {
 }
 ```
 
-### 2.3 功能点2：需求列表展示与选择
+**后端数据库表设计**：
+```sql
+-- 附屏会话表
+CREATE TABLE t_sidepanel_session (
+    id VARCHAR(64) PRIMARY KEY COMMENT '会话ID',
+    ts_id VARCHAR(64) NOT NULL COMMENT '测试单ID',
+    user_id VARCHAR(64) NOT NULL COMMENT '用户ID',
+    session_status VARCHAR(32) COMMENT '会话状态：active/closed',
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    expire_time TIMESTAMP COMMENT '过期时间',
+    INDEX idx_ts_id (ts_id),
+    INDEX idx_user_id (user_id)
+) COMMENT='附屏会话表';
+```
 
-#### 详细描述
+### 2.4 功能点2：需求列表展示与选择
+
+#### 2.4.1 前端设计
 
 **功能说明**：
 展示当前TS（测试单）涉及的所有需求列表，支持用户切换选择不同需求进行测试点生成。
 
-**数据库表设计**：
+**前端组件设计**：
+```plantuml
+@startuml
+class RequirementSection {
+    - requirements: Requirement[]
+    - selectedRequirement: Requirement | null
+    - loading: boolean
+    + onInit(): void
+    + onRequirementSelect(req: Requirement): void
+    + onRequirementDetailView(reqId: string): void
+}
+
+class RequirementList {
+    - requirements: Requirement[]
+    - selectedId: string
+    + render(): VNode
+    + handleSelect(id: string): void
+}
+
+class RequirementDetailDialog {
+    - visible: boolean
+    - requirement: RequirementDetail | null
+    + open(reqId: string): void
+    + close(): void
+}
+
+RequirementSection *-- RequirementList
+RequirementSection *-- RequirementDetailDialog
+
+@enduml
+```
+
+**前端交互流程**：
+```plantuml
+@startuml
+start
+
+:页面加载;
+:调用API获取需求列表;
+
+if (获取成功?) then (是)
+    :渲染需求列表;
+    :默认选中第一个需求;
+else (否)
+    :显示错误提示;
+    :显示重试按钮;
+    stop
+endif
+
+:用户浏览需求列表;
+
+repeat
+    :用户点击需求项;
+    :高亮选中的需求;
+    :更新Store状态;
+    :触发后续workflow加载;
+    
+    if (用户点击详情?) then (是)
+        :打开需求详情对话框;
+        :异步加载需求详细信息;
+        :展示需求文档内容;
+    endif
+    
+repeat while (继续选择?) is (是)
+->否;
+
+stop
+
+@enduml
+```
+
+**前端状态管理**：
+```typescript
+// 需求相关State
+interface RequirementState {
+    requirements: Requirement[];
+    selectedRequirement: Requirement | null;
+    requirementDetail: RequirementDetail | null;
+    loading: boolean;
+    error: string | null;
+}
+
+// 需求相关Actions
+const useRequirementStore = defineStore('requirement', {
+    state: (): RequirementState => ({
+        requirements: [],
+        selectedRequirement: null,
+        requirementDetail: null,
+        loading: false,
+        error: null
+    }),
+    
+    actions: {
+        async fetchRequirements(tsId: string) {
+            this.loading = true;
+            try {
+                const response = await api.getRequirements({ tsId });
+                this.requirements = response.requirements;
+                if (this.requirements.length > 0) {
+                    this.selectedRequirement = this.requirements[0];
+                }
+            } catch (error) {
+                this.error = error.message;
+            } finally {
+                this.loading = false;
+            }
+        },
+        
+        selectRequirement(requirement: Requirement) {
+            this.selectedRequirement = requirement;
+        },
+        
+        async fetchRequirementDetail(reqId: string) {
+            const response = await api.getRequirementDetail({ reqId });
+            this.requirementDetail = response;
+        }
+    }
+});
+```
+
+**前端API调用**：
+```typescript
+// API Service层
+export const requirementApi = {
+    getRequirements(params: GetRequirementsRequest): Promise<GetRequirementsResponse> {
+        return axios.get('/api/v1/requirements', { params });
+    },
+    
+    getRequirementDetail(params: GetRequirementDetailRequest): Promise<RequirementDetail> {
+        return axios.get(`/api/v1/requirements/${params.reqId}`);
+    }
+};
+```
+
+#### 2.4.2 后端设计
+
+**后端服务架构**：
+```plantuml
+@startuml
+package "Controller层" {
+    [RequirementController]
+}
+
+package "Service层" {
+    [RequirementService]
+    [RequirementQueryService]
+}
+
+package "Domain层" {
+    [RequirementEntity]
+    [RequirementRepository]
+}
+
+package "DAO层" {
+    [RequirementMapper]
+}
+
+[RequirementController] --> [RequirementService]
+[RequirementService] --> [RequirementQueryService]
+[RequirementService] --> [RequirementRepository]
+[RequirementRepository] --> [RequirementMapper]
+[RequirementRepository] ..> [RequirementEntity]
+
+@enduml
+```
+
+**后端数据库表设计**：
 ```sql
 -- 需求信息表
 CREATE TABLE t_requirement (
@@ -137,40 +652,63 @@ CREATE TABLE t_requirement (
     req_name VARCHAR(256) NOT NULL COMMENT '需求名称',
     req_desc TEXT COMMENT '需求描述',
     req_doc_url VARCHAR(512) COMMENT '需求文档URL',
+    req_doc_content LONGTEXT COMMENT '需求文档内容',
+    test_scope TEXT COMMENT '测试范围',
     status VARCHAR(32) COMMENT '需求状态',
     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_ts_id (ts_id)
+    INDEX idx_ts_id (ts_id),
+    INDEX idx_status (status)
 ) COMMENT='需求信息表';
 ```
 
-**序列图**：
-```plantuml
-@startuml
-actor 用户
-participant "附屏前端" as Frontend
-participant "后台服务" as Backend
-database "需求数据库" as DB
+**后端接口实现**：
+```java
+@RestController
+@RequestMapping("/api/v1/requirements")
+public class RequirementController {
+    
+    @Autowired
+    private RequirementService requirementService;
+    
+    @GetMapping
+    public ResponseEntity<GetRequirementsResponse> getRequirements(
+            @RequestParam String tsId) {
+        List<Requirement> requirements = requirementService.getRequirementsByTsId(tsId);
+        return ResponseEntity.ok(new GetRequirementsResponse(requirements));
+    }
+    
+    @GetMapping("/{reqId}")
+    public ResponseEntity<RequirementDetail> getRequirementDetail(
+            @PathVariable String reqId) {
+        RequirementDetail detail = requirementService.getRequirementDetail(reqId);
+        return ResponseEntity.ok(detail);
+    }
+}
 
-用户 -> Frontend: 进入AI辅助测试点生成
-Frontend -> Backend: 获取需求列表(tsId)
-Backend -> DB: 查询需求信息
-DB --> Backend: 返回需求列表
-Backend --> Frontend: 需求列表数据
-Frontend --> 用户: 展示需求列表
-
-用户 -> Frontend: 选择需求
-Frontend -> Frontend: 更新当前选中需求
-Frontend -> Backend: 获取需求详情(reqId)
-Backend -> DB: 查询需求详细信息
-DB --> Backend: 需求详细数据
-Backend --> Frontend: 需求详情
-Frontend --> 用户: 展示需求详情
-
-@enduml
+@Service
+public class RequirementService {
+    
+    @Autowired
+    private RequirementRepository requirementRepository;
+    
+    @Autowired
+    private RequirementQueryService queryService;
+    
+    public List<Requirement> getRequirementsByTsId(String tsId) {
+        return requirementRepository.findByTsId(tsId);
+    }
+    
+    public RequirementDetail getRequirementDetail(String reqId) {
+        RequirementEntity entity = requirementRepository.findById(reqId)
+            .orElseThrow(() -> new NotFoundException("需求不存在"));
+        
+        return queryService.buildRequirementDetail(entity);
+    }
+}
 ```
 
-**接口定义**：
+**后端接口定义**：
 ```typescript
 // 获取需求列表
 interface GetRequirementsRequest {
@@ -198,17 +736,150 @@ interface RequirementDetail extends Requirement {
     fullDescription: string;
     attachments: string[];
     testScope: string;
+    docContent: string;
 }
 ```
 
-### 2.4 功能点3：Workflow配置管理
+### 2.5 功能点3：Workflow配置管理
 
-#### 详细描述
+#### 2.5.1 前端设计
 
 **功能说明**：
 展示当前可用的测试点生成workflow（已在配置中心预先配置），支持用户切换选择不同的workflow。
 
-**数据库表设计**：
+**前端组件设计**：
+```plantuml
+@startuml
+class WorkflowSection {
+    - workflows: WorkflowInfo[]
+    - selectedWorkflow: WorkflowInfo | null
+    - filterType: string
+    - loading: boolean
+    + onInit(): void
+    + onWorkflowSelect(workflow: WorkflowInfo): void
+    + onFilterChange(type: string): void
+}
+
+class WorkflowSelector {
+    - workflows: WorkflowInfo[]
+    - selectedId: string
+    + render(): VNode
+    + handleSelect(id: string): void
+}
+
+class WorkflowCard {
+    - workflow: WorkflowInfo
+    - isSelected: boolean
+    + render(): VNode
+}
+
+WorkflowSection *-- WorkflowSelector
+WorkflowSelector *-- WorkflowCard
+
+@enduml
+```
+
+**前端状态管理**：
+```typescript
+// Workflow相关State
+interface WorkflowState {
+    workflows: WorkflowInfo[];
+    selectedWorkflow: WorkflowInfo | null;
+    filterType: string;
+    loading: boolean;
+    error: string | null;
+}
+
+// Workflow相关Actions
+const useWorkflowStore = defineStore('workflow', {
+    state: (): WorkflowState => ({
+        workflows: [],
+        selectedWorkflow: null,
+        filterType: 'all',
+        loading: false,
+        error: null
+    }),
+    
+    actions: {
+        async fetchWorkflows(workflowType?: string) {
+            this.loading = true;
+            try {
+                const response = await workflowApi.getWorkflows({ workflowType });
+                this.workflows = response.workflows;
+            } catch (error) {
+                this.error = error.message;
+            } finally {
+                this.loading = false;
+            }
+        },
+        
+        selectWorkflow(workflow: WorkflowInfo) {
+            this.selectedWorkflow = workflow;
+        }
+    },
+    
+    getters: {
+        filteredWorkflows(): WorkflowInfo[] {
+            if (this.filterType === 'all') {
+                return this.workflows;
+            }
+            return this.workflows.filter(w => w.type === this.filterType);
+        }
+    }
+});
+```
+
+**前端API调用**：
+```typescript
+// Workflow API Service
+export const workflowApi = {
+    getWorkflows(params: GetWorkflowsRequest): Promise<GetWorkflowsResponse> {
+        return axios.get('/api/v1/workflows', { params });
+    }
+};
+```
+
+#### 2.5.2 后端设计
+
+**后端服务架构**：
+```plantuml
+@startuml
+package "Controller层" {
+    [WorkflowController]
+}
+
+package "Service层" {
+    [WorkflowService]
+}
+
+package "Domain层" {
+    [WorkflowConfigEntity]
+    [AIModelConfigEntity]
+    [WorkflowRepository]
+}
+
+package "DAO层" {
+    [WorkflowMapper]
+    [AIModelMapper]
+}
+
+package "数据库" {
+    [MySQL]
+}
+
+[WorkflowController] --> [WorkflowService]
+[WorkflowService] --> [WorkflowRepository]
+[WorkflowRepository] --> [WorkflowMapper]
+[WorkflowRepository] --> [AIModelMapper]
+[WorkflowRepository] ..> [WorkflowConfigEntity]
+[WorkflowRepository] ..> [AIModelConfigEntity]
+[WorkflowMapper] --> [MySQL]
+[AIModelMapper] --> [MySQL]
+
+@enduml
+```
+
+**后端数据库表设计**：
 ```sql
 -- Workflow配置表
 CREATE TABLE t_workflow_config (
@@ -222,7 +893,9 @@ CREATE TABLE t_workflow_config (
     model_id VARCHAR(64) COMMENT '关联的模型ID',
     is_active TINYINT DEFAULT 1 COMMENT '是否启用',
     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_type (workflow_type),
+    INDEX idx_active (is_active)
 ) COMMENT='Workflow配置表';
 
 -- 模型配置表
@@ -237,11 +910,12 @@ CREATE TABLE t_ai_model_config (
     temperature DECIMAL(3,2) COMMENT '温度参数',
     is_active TINYINT DEFAULT 1 COMMENT '是否启用',
     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_active (is_active)
 ) COMMENT='AI模型配置表';
 ```
 
-**类图**：
+**后端领域模型**：
 ```plantuml
 @startuml
 class WorkflowConfig {
@@ -254,9 +928,6 @@ class WorkflowConfig {
     - templateParams: object
     - modelId: string
     - isActive: boolean
-    + getWorkflowList(): WorkflowConfig[]
-    + getWorkflowById(id: string): WorkflowConfig
-    + executeWorkflow(params: object): Promise<WorkflowResult>
 }
 
 class AIModelConfig {
@@ -269,8 +940,6 @@ class AIModelConfig {
     - maxTokens: number
     - temperature: number
     - isActive: boolean
-    + getModelById(id: string): AIModelConfig
-    + callModel(prompt: string): Promise<string>
 }
 
 class WorkflowResult {
@@ -285,7 +954,71 @@ WorkflowConfig ..> WorkflowResult : produces
 @enduml
 ```
 
-**接口定义**：
+**后端接口实现**：
+```java
+@RestController
+@RequestMapping("/api/v1/workflows")
+public class WorkflowController {
+    
+    @Autowired
+    private WorkflowService workflowService;
+    
+    @GetMapping
+    public ResponseEntity<GetWorkflowsResponse> getWorkflows(
+            @RequestParam(required = false) String workflowType) {
+        List<WorkflowInfo> workflows = workflowService.getActiveWorkflows(workflowType);
+        return ResponseEntity.ok(new GetWorkflowsResponse(workflows));
+    }
+}
+
+@Service
+public class WorkflowService {
+    
+    @Autowired
+    private WorkflowRepository workflowRepository;
+    
+    @Autowired
+    private AIModelRepository aiModelRepository;
+    
+    public List<WorkflowInfo> getActiveWorkflows(String workflowType) {
+        // 从数据库查询
+        List<WorkflowConfigEntity> entities;
+        if (workflowType != null && !workflowType.isEmpty()) {
+            entities = workflowRepository.findByTypeAndActive(workflowType, true);
+        } else {
+            entities = workflowRepository.findByActive(true);
+        }
+        
+        // 转换为VO并关联模型信息
+        List<WorkflowInfo> workflows = new ArrayList<>();
+        for (WorkflowConfigEntity entity : entities) {
+            WorkflowInfo info = convertToWorkflowInfo(entity);
+            workflows.add(info);
+        }
+        
+        return workflows;
+    }
+    
+    private WorkflowInfo convertToWorkflowInfo(WorkflowConfigEntity entity) {
+        WorkflowInfo info = new WorkflowInfo();
+        info.setId(entity.getId());
+        info.setName(entity.getWorkflowName());
+        info.setDescription(entity.getWorkflowDesc());
+        info.setType(entity.getWorkflowType());
+        info.setModelId(entity.getModelId());
+        
+        // 查询关联的模型名称
+        AIModelConfigEntity model = aiModelRepository.findById(entity.getModelId());
+        if (model != null) {
+            info.setModelName(model.getModelName());
+        }
+        
+        return info;
+    }
+}
+```
+
+**后端接口定义**：
 ```typescript
 // 获取Workflow列表
 interface GetWorkflowsRequest {
@@ -306,7 +1039,7 @@ interface GetWorkflowsResponse {
 }
 ```
 
-### 2.5 功能点4：Workflow执行引擎
+### 2.6 功能点4：Workflow执行引擎
 
 #### 详细描述
 
@@ -441,7 +1174,7 @@ interface ExecuteWorkflowResponse {
 }
 ```
 
-### 2.6 功能点5：Prompt模板处理
+### 2.7 功能点5：Prompt模板处理
 
 #### 详细描述
 
@@ -547,7 +1280,7 @@ interface ProcessPromptResponse {
 }
 ```
 
-### 2.7 功能点6：AI模型调用服务
+### 2.8 功能点6：AI模型调用服务
 
 #### 详细描述
 
@@ -659,7 +1392,7 @@ interface StreamMessage {
 }
 ```
 
-### 2.8 功能点7：流式结果展示
+### 2.9 功能点7：流式结果展示
 
 #### 详细描述
 
@@ -759,7 +1492,7 @@ class WebSocketManager {
 }
 ```
 
-### 2.9 功能点8：测试点接收与编辑
+### 2.10 功能点8：测试点接收与编辑
 
 #### 详细描述
 
@@ -867,7 +1600,7 @@ interface UpdateTestPointResponse {
 }
 ```
 
-### 2.10 功能点9：重新生成机制
+### 2.11 功能点9：重新生成机制
 
 #### 详细描述
 
@@ -1000,7 +1733,7 @@ interface GetGenerationHistoryResponse {
 }
 ```
 
-### 2.11 功能点10：数据回填与上报
+### 2.12 功能点10：数据回填与上报
 
 #### 详细描述
 
@@ -1170,10 +1903,13 @@ interface ReportToOpsPlatformResponse {
 ### 3.1 可靠性（Reliability）
 
 **策略**：
-1. **重试机制**：AI模型调用失败时，自动重试3次，重试间隔采用指数退避策略
+1. **重试机制**：AI模型调用失败时，自动重试3次，重试间隔采用指数退避策略（1s、2s、4s）
 2. **降级方案**：当AI服务不可用时，允许用户手工输入测试点
 3. **数据持久化**：每次生成的中间结果都持久化到数据库，防止数据丢失
-4. **事务保障**：回填操作使用分布式事务，保证数据一致性
+4. **事务保障**：
+   - 使用Spring @Transactional管理本地事务
+   - 回填操作记录详细日志，支持手工补偿
+   - 关键操作支持幂等性设计
 
 **监控指标**：
 - AI服务可用率 > 99.5%
@@ -1193,10 +1929,16 @@ interface ReportToOpsPlatformResponse {
 | 数据回填 | < 5s | 100 QPS |
 
 **优化策略**：
-1. **缓存机制**：Workflow配置、模型配置使用Redis缓存，TTL=1小时
-2. **连接池**：数据库连接池大小=50，AI模型HTTP连接池大小=20
-3. **异步处理**：数据回填和上报使用消息队列异步处理
-4. **CDN加速**：静态资源使用CDN分发
+1. **数据库优化**：
+   - 为高频查询字段添加索引（ts_id, status, workflow_type等）
+   - 使用HikariCP连接池，配置最小连接数=10，最大连接数=50
+   - 开启查询缓存和预编译语句缓存
+2. **连接池优化**：
+   - HTTP连接池大小=20，连接超时=5s，读超时=30s
+   - WebSocket连接池最大并发=100
+3. **批量处理**：测试点保存和回填支持批量操作，减少数据库交互次数
+4. **分页查询**：历史记录、测试点列表等使用分页查询，避免一次性加载大量数据
+5. **CDN加速**：静态资源使用CDN分发
 
 ### 3.3 安全性（Security）
 
@@ -1219,33 +1961,54 @@ interface ReportToOpsPlatformResponse {
 
 **设计原则**：
 1. **模块化设计**：前后端分离，业务逻辑分层（Controller-Service-DAO）
-2. **配置外部化**：所有配置项存储在配置中心，支持热更新
-3. **日志规范**：统一日志格式，包含traceId、requestId，便于问题追踪
+2. **配置外部化**：
+   - 使用Spring Boot配置文件（application.yml/application.properties）
+   - 支持多环境配置（dev、test、prod）
+   - 敏感配置（API密钥）通过环境变量注入
+3. **日志规范**：
+   - 使用SLF4J + Logback统一日志框架
+   - 日志格式包含：时间戳、日志级别、traceId、类名、方法名、消息
+   - 按天滚动归档，保留30天
 4. **监控告警**：
-   - 接入Prometheus + Grafana监控系统
+   - 使用Spring Boot Actuator暴露健康检查端点
+   - 关键业务指标记录到数据库，定时巡检
    - 关键指标告警：AI调用失败率 > 5%、响应时间 > 10s
 5. **版本管理**：
    - API版本化：/api/v1/、/api/v2/
-   - Workflow版本管理：支持多版本并存，灰度发布
+   - Workflow版本管理：通过数据库version字段支持多版本并存
 
 ### 3.5 可扩展性（Scalability）
 
 **扩展能力**：
-1. **水平扩展**：无状态服务设计，支持Kubernetes自动扩缩容
-2. **AI模型可插拔**：通过模型配置表支持接入多个AI供应商（OpenAI、Claude、文心一言等）
-3. **Workflow扩展**：支持通过配置中心新增workflow，无需代码变更
-4. **存储扩展**：数据库支持分库分表，按tsId进行水平分片
+1. **水平扩展**：
+   - 无状态服务设计，支持多实例部署
+   - 使用Nginx进行负载均衡
+2. **AI模型可插拔**：
+   - 通过t_ai_model_config表配置支持接入多个AI供应商
+   - 支持OpenAI、Claude、文心一言、通义千问等
+3. **Workflow扩展**：
+   - 通过t_workflow_config表新增workflow配置
+   - 无需代码变更，重启服务即可生效
+4. **存储扩展**：
+   - 数据库支持分库分表
+   - 建议按年份或ts_id范围进行分表
 
 ### 3.6 可用性（Availability）
 
 **高可用方案**：
 1. **服务部署**：至少2个实例，部署在不同可用区
-2. **数据库**：主从架构，自动故障切换（RTO < 5分钟）
+2. **数据库**：
+   - 主从架构（一主一从），自动故障切换（RTO < 5分钟）
+   - 定期进行主从同步延迟监控
 3. **负载均衡**：使用Nginx做负载均衡，健康检查间隔10s
-4. **熔断降级**：使用Sentinel实现熔断，熔断阈值：错误率 > 50%
+4. **熔断降级**：
+   - 使用Hystrix或自研熔断组件实现服务降级
+   - 熔断阈值：10秒内错误率 > 50%
+   - AI服务超时或失败时，提示用户手工输入
 5. **备份恢复**：
-   - 数据库每日全量备份
-   - 关键业务数据实时同步到备份库
+   - 数据库每日全量备份，保留7天
+   - 增量备份每小时一次
+   - 定期进行恢复演练
 
 ## 4 测试分析
 
